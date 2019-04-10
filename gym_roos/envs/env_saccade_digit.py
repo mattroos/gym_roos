@@ -28,14 +28,15 @@ import cv2
 import torch
 import torch.nn.functional as F
 
+import os
 import time
 import random
 import matplotlib.pyplot as plt
 plt.ion()
 
 
-R_CLASSIFY = 0.
-R_LOCALIZE = 0.
+R_CLASSIFY = 100.
+R_LOCALIZE = 100.
 R_FOVEAL = 100.
 # R_SACCADE = -0.05
 R_SACCADE = -0.0
@@ -49,11 +50,15 @@ CHARS = '0123456789 '
 EP_LENGTH = 20
 
 class EnvSaccadeDigit(Env):
-    def __init__(self, seed=None, cuda=False):
+    def __init__(self, seed=None, cuda=False,
+            # model_file='gym_roos/envs/model_params/model_env_saccade_digit.h5'):
+            model_file='/home/mroos/Code/gym_roos/gym_roos/envs/model_params/model_env_saccade_digit.h5'):
         if seed is None:
             seed = time.time()
         random.seed(seed)
 
+        self.cuda = cuda
+        self.device = torch.device("cuda:0" if torch.cuda.is_available() and cuda else "cpu")
         self.classes = CHARS
         self.scales = SCALES
         self.n_classes = len(CHARS)
@@ -73,14 +78,23 @@ class EnvSaccadeDigit(Env):
         # WARNING: Can observation space be [0,Inf]?
         self.observation_space = Box(low=0.0, high=np.Inf, shape=(256,), dtype=np.float32)    # ReLU output from RNN
 
-        ## Construct network and optimizer, and initialize parameters...
+        ## Construct network.
+        #  The network is similar to that by Minh, et al.
+        #       http://papers.nips.cc/paper/5542-recurrent-models-of-visual-attention
+        #  It converts the input image (glimpse) and fixation coordinates into
+        #  a feature vector that is stored in an RNN. The output of the RNN
+        #  serves as the observation vector for this environment.
         self.net = RnnChars2(n_pix_1d=self.fov_pix,
                              n_scales=self.n_scales,
                              n_cnn_channels_out=N_CNN_CHANNELS_OUT,
                              n_classes=self.n_classes)
 
-        self.cuda = cuda
-        self.device = torch.device("cuda:0" if torch.cuda.is_available() and cuda else "cpu")
+        # Initialize network parameters.
+        # cwd = os.getcwd()
+        # print('\nLoading stored model parameters from %s' % os.path.join(cwd, model_file))
+        print('\nLoading stored model parameters from %s' % model_file)
+        step_start, learning_rate = net_utils.load_net(model_file, self.net, cuda=self.cuda)
+
         self.net.to(self.device)
         self.net.eval()
 
@@ -206,13 +220,14 @@ class EnvSaccadeDigit(Env):
     def _get_glimpse(self, fix_loc=None):
         # fix_loc (x, y) values should be in [-1, 1] range
         # fix_loc should be one-element list containing tensor of size(2,)
+
         if fix_loc is None:
             # Randomly select fixation location
             fix_x = 2 * random.randint(0,self.im_pix)/self.im_pix - 1
             fix_y = 2 * random.randint(0,self.im_pix)/self.im_pix - 1
             fix_loc = np.array([fix_x, fix_y])
         fix_loc = torch.FloatTensor(fix_loc)
-        fix_loc.to(self.device)
+        fix_loc = fix_loc.to(self.device)
         fix_loc = [fix_loc]
 
         # Get crops for each fixation/glimpse

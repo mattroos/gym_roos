@@ -14,8 +14,9 @@ def np_to_variable(x, is_cuda=True, dtype=torch.FloatTensor):
         v = v.cuda()
     return v
 
-def load_net(fname, net, optimizer=None):
-    sp = torch.load(fname) 
+def load_net(fname, net, optimizer=None, cuda=True):
+    device = torch.device("cuda:0" if torch.cuda.is_available() and cuda else "cpu")
+    sp = torch.load(fname, map_location=device)
 
     step = sp['step']
 
@@ -46,5 +47,6 @@ def load_net(fname, net, optimizer=None):
             traceback.print_exc()
     
     print(fname)
+
     return step, learning_rate 
     
