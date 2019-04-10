@@ -9,6 +9,10 @@
 #   import gym
 #   import gym_roos
 #   env = gym.make('SaccadeDigit-v0')
+#
+# Or, to import it without using gym:
+#   from gym_roos.envs.env_saccade_digit import EnvSaccadeDigit
+#   env = EnvSaccadeDigit()
 
 
 from gym_roos.envs.models import RnnChars2
