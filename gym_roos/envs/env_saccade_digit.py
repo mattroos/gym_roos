@@ -304,7 +304,7 @@ class EnvSaccadeDigit(Env):
             out_rnn = self.net.forward_rnn(glimpse, self.fix_loc).flatten()
 
             state = out_rnn.detach().cpu().numpy()
-            reward = (num_pix_observed + eps) / (self.max_pix_observable + eps) * R_FOVEAL
+            reward = (num_pix_observed) / (self.max_pix_observable + eps) * R_FOVEAL
             reward += R_SACCADE   # saccade penalty (MIGHT NOT WANT THIS. Just rely on time discounting to promote minimal saccades.)
 
         elif true_action == 1:
@@ -314,7 +314,7 @@ class EnvSaccadeDigit(Env):
             if char_prediction==self.char_label:
                 # Correct
                 reward += R_CLASSIFY
-                reward += np.sum(self.unobserved + eps) / (self.max_pix_observable + eps) * R_FOVEAL
+                reward += np.sum(self.unobserved) / (self.max_pix_observable + eps) * R_FOVEAL
             else:
                 # Incorrect
                 reward += R_MISCLASSIFY
