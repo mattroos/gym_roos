@@ -31,16 +31,24 @@ import torch.nn.functional as F
 import os
 import time
 import random
+import pdb
 import matplotlib.pyplot as plt
 plt.ion()
 
 
+#########################
+## TODO
+# - Might need/want action vector to have dimensions for x/y character center
+#   location that are distinct from those for x/y fixation location.
+
+
 R_CLASSIFY = 100.
 R_LOCALIZE = 100.
-R_FOVEAL = 100.
+R_FOVEAL = 100.   # TODO: Does this help convergence? Accuracy?
 # R_SACCADE = -0.05
 R_SACCADE = -0.0
-R_MISCLASSIFY = -R_CLASSIFY
+# R_MISCLASSIFY = -R_CLASSIFY   # Misclassification penalty hurts convergence?
+R_MISCLASSIFY = 0.
 
 SCALES = [1, 3, 5]
 IM_PIX = 256
@@ -48,6 +56,8 @@ FOV_PIX = 32
 N_CNN_CHANNELS_OUT = [16, 16, 16, 16]
 CHARS = '0123456789 '
 EP_LENGTH = 20
+
+eps = np.finfo(np.float).eps
 
 class EnvSaccadeDigit(Env):
     def __init__(self, seed=None, cuda=False,
@@ -214,7 +224,7 @@ class EnvSaccadeDigit(Env):
             self.char = char
             self.char_label = char_label
             self.imbw = np.greater(imbw, 0.0)
-            self.unobserved = self.imbw
+            self.unobserved = np.copy(self.imbw)
 
 
     def _get_glimpse(self, fix_loc=None):
@@ -294,7 +304,7 @@ class EnvSaccadeDigit(Env):
             out_rnn = self.net.forward_rnn(glimpse, self.fix_loc).flatten()
 
             state = out_rnn.detach().cpu().numpy()
-            reward = num_pix_observed / (self.max_pix_observable + 0.0001) * R_FOVEAL
+            reward = (num_pix_observed + eps) / (self.max_pix_observable + eps) * R_FOVEAL
             reward += R_SACCADE   # saccade penalty (MIGHT NOT WANT THIS. Just rely on time discounting to promote minimal saccades.)
 
         elif true_action == 1:
@@ -304,7 +314,7 @@ class EnvSaccadeDigit(Env):
             if char_prediction==self.char_label:
                 # Correct
                 reward += R_CLASSIFY
-                reward += np.sum(self.unobserved) / (self.max_pix_observable + 0.0001) * R_FOVEAL
+                reward += np.sum(self.unobserved + eps) / (self.max_pix_observable + eps) * R_FOVEAL
             else:
                 # Incorrect
                 reward += R_MISCLASSIFY
@@ -339,11 +349,11 @@ class EnvSaccadeDigit(Env):
 
 
     def render(self, fig_name=None, mode='human'):
-        # print('EnvSaccadeDigit.render() not yet implemented.')
         plt.subplot(1,2,1)
         plt.imshow(self.im_hires, aspect='equal')
         plt.xticks([])
         plt.yticks([])
+
         plt.subplot(1,2,2)
         plt.imshow(self.unobserved, aspect='equal')
         plt.xticks([])
