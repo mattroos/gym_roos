@@ -356,7 +356,7 @@ class EnvSaccadeDigit(Env):
         self.reward_sum += reward
         # print('a=%d, x=%0.2f, y=%0.2f, r=%0.1f, tr= %0.1f, d=%s' % (true_action, self.fix_loc[0][0], self.fix_loc[0][1],
         #                                                             reward, self.reward_sum, done,))
-        self.render()
+        # self.render()
 
         return state, reward, done, {}
 
