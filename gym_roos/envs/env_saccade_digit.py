@@ -44,9 +44,8 @@ plt.ion()
 
 R_CLASSIFY = 100.
 R_LOCALIZE = 100.
-R_FOVEAL = 100.   # TODO: Does this help convergence? Accuracy?
-# R_SACCADE = -0.05
-R_SACCADE = -0.0
+R_FOVEAL = 0.   # TODO: Does this help convergence? Accuracy?
+R_SACCADE = -0. # TODO: Does this help avoid excessive saccades (push for faster decisions)
 # R_MISCLASSIFY = -R_CLASSIFY   # Misclassification penalty hurts convergence?
 R_MISCLASSIFY = 0.
 
@@ -54,8 +53,9 @@ SCALES = [1, 3, 5]
 IM_PIX = 256
 FOV_PIX = 32
 N_CNN_CHANNELS_OUT = [16, 16, 16, 16]
-CHARS = '0123456789 '
-EP_LENGTH = 20
+# CHARS = '0123456789 '
+CHARS = '0123456789X'
+EP_LENGTH = 5
 
 eps = np.finfo(np.float).eps
 
@@ -81,9 +81,10 @@ class EnvSaccadeDigit(Env):
         self.images = [None]
         self.mask = None
         self.char = None
+        self.reward_sum = 0
 
-        # Actions are: [saccade, classify, uncertain, x, y, classes (11)]
-        self.action_space = Box(low=-1.0, high=1.0, shape=(self.n_classes+5,), dtype=np.float32)
+        # Actions are: [saccade, classify, uncertain, x_fix, y_fix, x_center, y_center classes (11)]
+        self.action_space = Box(low=-1.0, high=1.0, shape=(self.n_classes+7,), dtype=np.float32)
         
         # WARNING: Can observation space be [0,Inf]?
         self.observation_space = Box(low=0.0, high=np.Inf, shape=(256,), dtype=np.float32)    # ReLU output from RNN
@@ -108,6 +109,8 @@ class EnvSaccadeDigit(Env):
         self.net.to(self.device)
         self.net.eval()
 
+        self.action_last = np.zeros(self.n_classes+7)
+        self.true_action_last = -1
         self.reset()
 
 
@@ -175,7 +178,7 @@ class EnvSaccadeDigit(Env):
                     ix_top = random.randint(0, self.im_pix-h)
 
                     center_x = 2 * (ix_left + w/2.)/self.im_pix - 1
-                    center_y = 2 * (ix_top + w/2.)/self.im_pix - 1
+                    center_y = 2 * (ix_top + h/2.)/self.im_pix - 1
                     self.char_center = (center_x, center_y)
 
                     im = np.array(PIL.Image.new('RGB', (self.im_pix, self.im_pix), color_bg))
@@ -272,6 +275,7 @@ class EnvSaccadeDigit(Env):
 
 
     def reset(self):
+        self.reward_sum = 0
         self.current_step = 0
         self._create_image()
         glimpse, self.fix_loc, num_pix_observed = self._get_glimpse()
@@ -321,7 +325,8 @@ class EnvSaccadeDigit(Env):
 
             # Give partial reward if predicted (x,y) location is within 1 unit of actual center location
             if self.char != ' ':
-                dist = np.sqrt((action[3]-self.char_center[0])**2 + (action[4]-self.char_center[1])**2)
+                # dist = np.sqrt((action[3]-self.char_center[0])**2 + (action[4]-self.char_center[1])**2)
+                dist = np.sqrt((action[5]-self.char_center[0])**2 + (action[6]-self.char_center[1])**2)
                 dist = np.clip(dist, 0, 1)
                 r = (np.cos(np.pi*dist) + 1) / 2
                 reward += R_LOCALIZE * r
@@ -333,7 +338,8 @@ class EnvSaccadeDigit(Env):
 
             # Give partial reward if predicted (x,y) location is within 1 unit of actual center location
             if self.char != ' ':
-                dist = np.sqrt((action[3]-self.char_center[0])**2 + (action[4]-self.char_center[1])**2)
+                # dist = np.sqrt((action[3]-self.char_center[0])**2 + (action[4]-self.char_center[1])**2)
+                dist = np.sqrt((action[5]-self.char_center[0])**2 + (action[6]-self.char_center[1])**2)
                 dist = np.clip(dist, 0, 1)
                 r = (np.cos(np.pi*dist) + 1) / 2
                 reward += R_LOCALIZE * r
@@ -345,18 +351,32 @@ class EnvSaccadeDigit(Env):
             print('Error.')
             sys.exit()
 
+        self.action_last = action
+        self.true_action_last = true_action
+        self.reward_sum += reward
+        # print('a=%d, x=%0.2f, y=%0.2f, r=%0.1f, tr= %0.1f, d=%s' % (true_action, self.fix_loc[0][0], self.fix_loc[0][1],
+        #                                                             reward, self.reward_sum, done,))
+        self.render()
+
         return state, reward, done, {}
 
 
     def render(self, fig_name=None, mode='human'):
-        plt.subplot(1,2,1)
-        plt.imshow(self.im_hires, aspect='equal')
-        plt.xticks([])
-        plt.yticks([])
+        fig = plt.figure(1)
+        fig.clear()
+        (ax1, ax2) = fig.subplots(1, 2)
 
-        plt.subplot(1,2,2)
-        plt.imshow(self.unobserved, aspect='equal')
-        plt.xticks([])
-        plt.yticks([])
+        ax1.imshow(self.im_hires, aspect='equal')
+        ax1.set_xticklabels([])
+        ax1.set_yticklabels([])
+        # ax1.set_title('s %d, la=%d, r=%0.1f, loc=%0.2f,%0.2f' %(self.current_step, self.true_action_last,
+        #     self.reward_sum, self.fix_loc[0][0], self.fix_loc[0][1]))
+        ax1.set_title('s %d, la=%d, r=%0.1f, fix=%0.1f,%0.1f, c=%0.1f,%0.1f' %(self.current_step, self.true_action_last,
+            self.reward_sum, self.fix_loc[0][0], self.fix_loc[0][1], self.action_last[5], self.action_last[6]))
+
+        ax2.imshow(self.unobserved, aspect='equal')
+        ax2.set_xticklabels([])
+        ax2.set_yticklabels([])
 
         plt.pause(0.05)
+        pdb.set_trace()
