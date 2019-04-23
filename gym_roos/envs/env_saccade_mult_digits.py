@@ -44,10 +44,11 @@ plt.ion()
 
 R_CLASSIFY = 100.
 R_LOCALIZE = 100.
-R_FOVEAL = 0.   # TODO: Does this help convergence? Accuracy?
-R_SACCADE = -0. # TODO: Does this help avoid excessive saccades (push for faster decisions)
+R_FOVEAL = 100.   # TODO: Does this help convergence? Accuracy?
+# R_SACCADE = -0. # TODO: Does this help avoid excessive saccades (push for faster decisions)
 # R_MISCLASSIFY = -R_CLASSIFY   # Misclassification penalty hurts convergence?
-R_MISCLASSIFY = 0.
+R_MISCLASSIFY = -0.
+R_STEP_TIME = -0.
 
 SCALES = [1, 3, 5]
 IM_PIX = 256
@@ -96,6 +97,9 @@ class EnvSaccadeMultDigits(Env):
         self.mask = None
         self.char = None
         self.reward_sum = 0
+        self.reward_sum_classify = 0
+        self.reward_sum_localize = 0
+        self.reward_sum_foveal = 0
 
         # Actions are: [saccade, classify, uncertain, done, x_fix, y_fix, x_char, y_char, w, h, classes (11)]
         # TODO: Should "uncertain" be a different class, rather than a different action?
@@ -148,6 +152,11 @@ class EnvSaccadeMultDigits(Env):
                 scale = random.uniform(3,5)
                 thickness = np.random.randint(1,10)
 
+                # font = 1
+                # line = 1
+                # scale = random.uniform(4,4)
+                # thickness = np.random.randint(5,6)
+
                 im = np.array(PIL.Image.new('RGB', (self.im_pix, self.im_pix), self.color_bg))
                 cv2.putText(im, char, (self.im_pix//8, self.im_pix*7//8), font, scale, color_fg, thickness, line)
 
@@ -177,6 +186,8 @@ class EnvSaccadeMultDigits(Env):
 
                     ix_left = random.randint(0, self.im_pix-w)
                     ix_top = random.randint(0, self.im_pix-h)
+                    # ix_left = self.im_pix//2 - w//2
+                    # ix_top = self.im_pix//2 - h//2
 
                     center_x = 2 * (ix_left + w/2.)/self.im_pix - 1
                     center_y = 2 * (ix_top + h/2.)/self.im_pix - 1
@@ -233,7 +244,13 @@ class EnvSaccadeMultDigits(Env):
             self.char_locations.append(location)
         self.char_labels = np.array(self.char_labels)
         self.char_locations = np.array(self.char_locations)
+        self.char_radii = np.sqrt((self.char_locations[:,2]/2)**2 + (self.char_locations[:,3]/2)**2)
 
+        ## Build images at other scales/resolutions, using torch
+        self._create_scaled_images(self.im_hires)
+
+
+    def _create_scaled_images(self, im):
         ## Build images at other scales/resolutions, using torch
         im = self.im_hires.astype(np.float32)/128 - 1
         images = net_utils.np_to_variable(im, is_cuda=torch.cuda.is_available() and self.cuda).permute(2, 0, 1).contiguous()
@@ -304,7 +321,7 @@ class EnvSaccadeMultDigits(Env):
         return glimpse, fix_loc, num_pix_observed
 
 
-    def _get_classify_reward(self, char_prediction, location):
+    def _get_classify_reward(self, location, char_prediction):
         ## Make prediction landscape
         ix_x = (location[0] + 1)/2 * self.im_pix//2
         ix_y = (location[1] + 1)/2 * self.im_pix//2
@@ -333,11 +350,89 @@ class EnvSaccadeMultDigits(Env):
         return reward
 
 
+    def _get_classify_reward2(self, location, char_prediction=None):
+        ## TODO:
+        # 1. Find closest character and reward if localization is good.
+        # 2. If character class was predicted, give classification reward or penalty.
+
+        # ## Reward if location is close enough to center of character
+        # if char_prediction is None:
+        #     ix_class = np.arange(len(self.char_labels))
+        #     reward_classify = 0     # reward for localization, but not classification
+        # else:
+        #     ix_class = np.where(self.char_labels==char_prediction)[0]
+        #     reward_classify = R_CLASSIFY
+
+        # if ix_class.size==0:
+        #     reward = R_MISCLASSIFY
+        #     return reward
+        ix_class = np.arange(len(self.char_labels))
+
+        if ix_class.size==0:
+            if char_prediction is None:
+                reward = 0
+            else:
+                reward = R_MISCLASSIFY
+                self.reward_sum_classify += R_MISCLASSIFY
+            return reward
+
+        reward = 0
+
+        # Find the distance between the predicted location and all candidate characters
+        # Could consider using normalized distance instead (normalized by radius)
+        rad = self.char_radii[ix_class]
+        center_in_pix = (self.char_locations[ix_class,0:2]+1)/2 * self.im_pix
+        dist = np.sqrt(np.sum(((location[0:2]+1)/2*self.im_pix - center_in_pix)**2, axis=1))
+        ix_closest = np.argmin(dist)
+        # if dist[ix_closest] < rad[ix_closest]/2:
+        if dist[ix_closest] < rad[ix_closest]:
+            # Hit
+            if char_prediction is None:
+                rew_loc = max(rad[ix_closest] - dist[ix_closest],0) / rad[ix_closest] * R_LOCALIZE
+                reward += rew_loc
+                self.reward_sum_localize += rew_loc
+                # Reward for "knowing" that it has a weak character prediction.
+                # IS THIS USEFUL TO DO? ALREADY GIVING LOCALIZATION REWARD SO THIS MAY BE DETRIMENTAL.
+                # reward += R_CLASSIFY/self.n_classes
+                # Remove char from list of rewardables ...
+                self.char_labels = np.delete(self.char_labels, ix_closest, axis=0)
+                self.char_locations = np.delete(self.char_locations, ix_closest, axis=0)
+                self.char_radii = np.delete(self.char_radii, ix_closest, axis=0)
+            else:
+                if self.char_labels[ix_closest]==char_prediction:
+                    reward += R_CLASSIFY
+                    self.reward_sum_classify += R_CLASSIFY
+
+                    rew_loc = max(rad[ix_closest] - dist[ix_closest],0) / rad[ix_closest] * R_LOCALIZE
+                    reward += rew_loc
+                    self.reward_sum_localize += rew_loc
+                    
+                    # Remove char from list of rewardables ...
+                    self.char_labels = np.delete(self.char_labels, ix_closest, axis=0)
+                    self.char_locations = np.delete(self.char_locations, ix_closest, axis=0)
+                    self.char_radii = np.delete(self.char_radii, ix_closest, axis=0)
+                else:
+                    reward += R_MISCLASSIFY
+                    self.reward_sum_classify += R_MISCLASSIFY
+                    # No reward for localization if misclassified.
+                    # Leave char in list of rewardables.
+
+        else:
+            # No hit
+            reward = 0
+
+        return reward
+
+
     def reset(self):
         self.reward_sum = 0
+        self.reward_sum_classify = 0
+        self.reward_sum_localize = 0
+        self.reward_sum_foveal = 0
         self.current_step = 0
         self._create_image(2)
         glimpse, self.fix_loc, num_pix_observed = self._get_glimpse()
+        # glimpse, self.fix_loc, num_pix_observed = self._get_glimpse([0,0])
 
         # Exclude pix in initial foveal region from total number of pix "observable" by agent...
         self.max_pix_observable = np.sum(self.imbw) - num_pix_observed
@@ -355,11 +450,16 @@ class EnvSaccadeMultDigits(Env):
         #   https://github.com/ikostrikov/pytorch-a2c-ppo-acktr-gail/issues/109
         #   https://github.com/openai/baselines/issues/121
         action = (np.tanh(action) + 1) / 2 * (self.action_space.high - self.action_space.low) + self.action_space.low
+        # action = np.random.rand(10+self.n_classes)*2 - 1
 
         self.current_step += 1
         done = self.current_step >= self.ep_length
-        reward = 0
         true_action = np.argmax(action[0:4]) # [saccade, classify, uncertain, done]
+
+        if true_action==3:
+            reward = 0
+        else:
+            reward = R_STEP_TIME
 
         if true_action == 0:
             # Declaration: saccade
@@ -369,32 +469,46 @@ class EnvSaccadeMultDigits(Env):
 
             state = out_rnn.detach().cpu().numpy()
             self.last_state = state
-            reward = (num_pix_observed) / (self.max_pix_observable + eps) * R_FOVEAL
-            reward += R_SACCADE   # saccade penalty (MIGHT NOT WANT THIS. Just rely on time discounting to promote minimal saccades.)
+            rew_foveal = (num_pix_observed) / (self.max_pix_observable + eps) * R_FOVEAL
+            reward += rew_foveal
+            self.reward_sum_foveal += rew_foveal
+            #reward += R_SACCADE   # saccade penalty (MIGHT NOT WANT THIS. Just rely on time discounting to promote minimal saccades.)
 
         elif true_action == 1 or true_action == 2:
             # Declaration: classify or uncertain
             
-            char_prediction = np.argmax(action[-self.n_classes:])
-
-            # Get reward based on remaining reward landscape for the predicted class
-            r = self._get_classify_reward(char_prediction, action[6:10])
-
             if true_action == 1:
                 # Classify
-                reward += R_CLASSIFY * r
+                char_prediction = np.argmax(action[-self.n_classes:])
+                # reward += self._get_classify_reward(action[6:10], char_prediction=char_prediction)
+                # reward += self._get_classify_reward2(action[6:10], char_prediction=char_prediction)
+                reward += self._get_classify_reward2(action[[4,5,8,9]], char_prediction=char_prediction)
             else:
                 # Uncertain. In this case the reward landscape is decremented as if the
                 # correct classification was given, but the actual reward is only a fraction
                 # of what a true classification reward would be.
-                reward += R_CLASSIFY * r / 2.
+                # reward += self._get_classify_reward2(action[6:10], char_prediction=None)
+                reward += self._get_classify_reward2(action[[4,5,8,9]], char_prediction=None)
 
+            # Annotate image to indicate agent has made a localization decision
+            #################################
+            ## TODO:
+            #   1. Annotate
+            #   2. Update scaled images
+            #   3. Get new RNN output (new state)
+            #################################
             state = self.last_state
 
         elif true_action == 3:
             # Declaration: done
             done = True
             state = np.zeros(self.observation_space.shape)
+
+            # # If no characters left to be found, give full foveal score
+            # if self.char_labels.size==0:
+            #     rew_foveal = np.sum(self.unobserved) / (self.max_pix_observable + eps) * R_FOVEAL
+            #     reward += rew_foveal
+            #     self.reward_sum_foveal += rew_foveal
 
         else:
             # Should never reach this
@@ -407,26 +521,29 @@ class EnvSaccadeMultDigits(Env):
         # print('a=%d, x=%0.2f, y=%0.2f, r=%0.1f, tr= %0.1f, d=%s' % (true_action, self.fix_loc[0][0], self.fix_loc[0][1],
         #                                                             reward, self.reward_sum, done,))
         # self.render()
-
         return state, reward, done, {}
 
 
     def render(self, fig_name=None, mode='human'):
         fig = plt.figure(1)
         fig.clear()
-        (ax1, ax2) = fig.subplots(1, 2)
+        (ax1, ax2) = fig.subplots(2,1)
 
-        ax1.imshow(self.im_hires, aspect='equal')
-        ax1.set_xticklabels([])
-        ax1.set_yticklabels([])
+        ax1.imshow(self.im_hires, aspect='auto') #, aspect='equal')
+        # ax1.set_xticklabels([])
+        # ax1.set_yticklabels([])
+        ax1.grid(True)
+
         # ax1.set_title('s %d, la=%d, r=%0.1f, loc=%0.2f,%0.2f' %(self.current_step, self.true_action_last,
         #     self.reward_sum, self.fix_loc[0][0], self.fix_loc[0][1]))
         ax1.set_title('s %d, la=%d, r=%0.1f, fix=%0.1f,%0.1f, c=%0.1f,%0.1f' %(self.current_step, self.true_action_last,
-            self.reward_sum, self.fix_loc[0][0], self.fix_loc[0][1], self.action_last[5], self.action_last[6]))
+            self.reward_sum, self.fix_loc[0][0], self.fix_loc[0][1], self.action_last[6], self.action_last[7]))
+        print(self.action_last)
 
-        ax2.imshow(self.unobserved, aspect='equal')
-        ax2.set_xticklabels([])
-        ax2.set_yticklabels([])
+        ax2.imshow(self.unobserved, aspect='auto') #, aspect='equal')
+        # ax2.set_xticklabels([])
+        # ax2.set_yticklabels([])
+        ax2.grid(True)
 
         plt.pause(0.05)
         pdb.set_trace()
