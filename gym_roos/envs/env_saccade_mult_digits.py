@@ -239,6 +239,9 @@ class EnvSaccadeMultDigits(Env):
         self.char_locations = np.array(self.char_locations)
         self.char_radii = np.sqrt((self.char_locations[:,2]/2)**2 + (self.char_locations[:,3]/2)**2)
 
+        ## Keep extra images copy for annotated rendering, not to be seen by the agent        
+        self.im_hires_ann = np.copy(self.im_hires)
+
         ## Build images at other scales/resolutions, using torch
         self._create_scaled_images(self.im_hires)
 
@@ -309,12 +312,46 @@ class EnvSaccadeMultDigits(Env):
                 self.unobserved[iy_top:iy_bottom, ix_left:ix_right] = False
 
                 # Draw an outline of the foveal region on the image, for rendering
-                cv2.rectangle(self.im_hires, (ix_left,iy_top), (ix_right,iy_bottom), (0,0,0), 2)
+                # cv2.rectangle(self.im_hires, (ix_left,iy_top), (ix_right,iy_bottom), (0,0,0), 2)
+                cv2.rectangle(self.im_hires_ann, (ix_left,iy_top), (ix_right,iy_bottom), (0,0,0), 2)
 
         return glimpse, fix_loc, num_pix_observed
 
 
+    def _iou(self, test_location, true_locations):
+        ## location arrays should be: [ x_center(-1,1), y_center(-1,1), w(pixels), h(pixels) ]
+
+        # Covert (x,y) coordinates to pixel units
+        test_location[0:2] = (test_location[0:2]+1)/2 * self.im_pix
+        true_locations[:,0:2] = (true_locations[:,0:2]+1)/2 * self.im_pix
+
+        # Convert coordinates to top-left and bottom-right points.
+        tl_test = test_location[0:2] - test_location[2:4]/2
+        br_test = test_location[0:2] + test_location[2:4]/2
+        tl_true = true_locations[:,0:2] - true_locations[:,2:4]/2
+        br_true = true_locations[:,0:2] + true_locations[:,2:4]/2
+
+        # Compute intersection areas
+        xA = np.maximum(tl_test[0], tl_true[:,0])
+        yA = np.maximum(tl_test[1], tl_true[:,1])
+        xB = np.minimum(br_test[0], br_true[:,0])
+        yB = np.minimum(br_test[1], br_true[:,1])
+        interarea = np.maximum(0,(xB - xA + 1)) * np.maximum(0,(yB - yA + 1))
+  
+        # Compute the area of rectangles
+        area_test = (br_test[0] - tl_test[0] + 1) * (br_test[1] - tl_test[1] + 1)
+        area_true = (br_true[:,0] - tl_true[:,0] + 1) * (br_true[:,1] - tl_true[:,1] + 1)
+
+        iou = interarea / (area_true + area_test - interarea)
+        return iou
+
+
     def _get_classify_reward(self, location, char_prediction):
+        ## DEPRICATED.
+        ## Given a predicted character class, find the closest character of that
+        #  class and issue a reward based on the overlap between that character
+        #  classes reward landscape, and that of the prediction.
+
         ## Make prediction landscape
         ix_x = (location[0] + 1)/2 * self.im_pix//2
         ix_y = (location[1] + 1)/2 * self.im_pix//2
@@ -400,6 +437,84 @@ class EnvSaccadeMultDigits(Env):
         return reward
 
 
+    def _get_classify_reward3(self, location, char_prediction=None):
+        ## Similar to _get_classify_reward2() except that (1) location reward
+        #  is based on IOU of bounding boxes rather than distances between
+        #  actual and predicted center points, and (2) if a character
+        #  prediction is made, the predicated location/box is only compared
+        #  with those of the same character class (e.g., if two characters
+        #  have the same box dimension/location, either character could
+        #  be classified, localized, and rewarded).
+
+        ## Issue two types of rewards: (1) if predicted location is within radius
+        #  of character, and (2) if character class is correctly predicted. If the
+        #  character is correctly predicted, it is removed from the list of
+        #  rewardable decisions. If it is incorrectly predicted no localization
+        #  reward is given, and misclassification penalty is given, and the
+        #  character is not removed from the list of rewardables.
+
+        ## Get indices of true characters (candidates) with which prediction should be compared.
+        if char_prediction:
+            ix_cand = np.where(self.char_labels==char_prediction)[0]
+        else:
+            ix_cand = np.arange(len(self.char_labels))
+
+        ## If no rewardable characters are left, penalize (if needed) and return.
+        if len(ix_cand)==0:
+            if char_prediction is None:
+                reward = 0
+            else:
+                reward = R_MISCLASSIFY
+                self.reward_sum_classify += R_MISCLASSIFY
+            return reward
+
+        reward = 0
+
+        # Find the IOU similarity (1 - Jaccard distance) between the predicted
+        # location and all candidate characters.
+        location_converted = np.copy(location)
+        location_converted[2:4] = (location[2:4]+1)/2 * self.im_pix
+        similarities = self._iou(location_converted, self.char_locations)
+        # rad = self.char_radii[ix_cand]
+        # center_in_pix = (self.char_locations[ix_cand,0:2]+1)/2 * self.im_pix
+        # dist = np.sqrt(np.sum(((location[0:2]+1)/2*self.im_pix - center_in_pix)**2, axis=1))
+        ix_closest = np.argmax(similarities)
+
+        # if dist[ix_closest] < rad[ix_closest]:
+        if similarities[ix_closest] > 0:
+            if char_prediction is None:
+                # rew_loc = max(rad[ix_closest] - dist[ix_closest],0) / rad[ix_closest] * R_LOCALIZE
+                rew_loc = similarities[ix_closest] * R_LOCALIZE
+                reward += rew_loc
+                self.reward_sum_localize += rew_loc
+
+                # Remove char from list of rewardables ...
+                self.char_labels = np.delete(self.char_labels, ix_closest, axis=0)
+                self.char_locations = np.delete(self.char_locations, ix_closest, axis=0)
+                self.char_radii = np.delete(self.char_radii, ix_closest, axis=0)
+            else:
+                if self.char_labels[ix_closest]==char_prediction:
+                    reward += R_CLASSIFY
+                    self.reward_sum_classify += R_CLASSIFY
+
+                    # rew_loc = max(rad[ix_closest] - dist[ix_closest],0) / rad[ix_closest] * R_LOCALIZE
+                    rew_loc = similarities[ix_closest] * R_LOCALIZE
+                    reward += rew_loc
+                    self.reward_sum_localize += rew_loc
+                    
+                    # Remove char from list of rewardables ...
+                    self.char_labels = np.delete(self.char_labels, ix_closest, axis=0)
+                    self.char_locations = np.delete(self.char_locations, ix_closest, axis=0)
+                    self.char_radii = np.delete(self.char_radii, ix_closest, axis=0)
+                else:
+                    reward += R_MISCLASSIFY
+                    self.reward_sum_classify += R_MISCLASSIFY
+                    # No reward for localization if misclassified.
+                    # Leave char in list of rewardables.
+
+        return reward
+
+
     def reset(self):
         self.reward_sum = 0
         self.reward_sum_classify = 0
@@ -463,28 +578,36 @@ class EnvSaccadeMultDigits(Env):
             if action_taken == 'classify':
                 # Classify
                 char_prediction = np.argmax(action[-self.n_classes:])
-                # reward += self._get_classify_reward(action[6:10], char_prediction=char_prediction)
-                # reward += self._get_classify_reward2(action[6:10], char_prediction=char_prediction)
-                # reward += self._get_classify_reward2(action[[4,5,8,9]], char_prediction=char_prediction)
-                reward += self._get_classify_reward2(action[4:8], char_prediction=char_prediction)
+                # reward += self._get_classify_reward(action[4:8], char_prediction=char_prediction)
+                # reward += self._get_classify_reward2(action[4:8], char_prediction=char_prediction)
+                reward += self._get_classify_reward3(action[4:8], char_prediction=char_prediction)
             else:
                 # Uncertain.
                 # In this case the reward landscape is decremented as if the
                 # correct classification was given, but the actual reward is only
                 # a fraction of what a true classification reward would be.
-                # reward += self._get_classify_reward2(action[6:10], char_prediction=None)
-                # reward += self._get_classify_reward2(action[[4,5,8,9]], char_prediction=None)
-                reward += self._get_classify_reward2(action[4:8], char_prediction=None)
+                # reward += self._get_classify_reward2(action[4:8], char_prediction=None)
+                # reward += self._get_classify_reward2(action[4:8], char_prediction=None)
+                reward += self._get_classify_reward3(action[4:8], char_prediction=None)
 
-            # Annotate image to indicate agent has made a localization decision
-            #################################
-            ## TODO:
-            #   0. Use IOU for location score rather than point distance from char center
-            #   1. Annotate
-            #   2. Update scaled images
-            #   3. Get new RNN output (new state)
-            #################################
-            #state = self.last_state
+
+            ## Annotate predicted bounding box. Would be nice to do this with black/white
+            # dashed line instead, so it will be visible regardless of back/foreground colors.
+            box = action[4:8]
+            box = (box+1)/2 * self.im_pix     # convert to pixel coordinates
+            top_left = tuple(np.round(np.array([box[0] - box[2]/2, box[1] - box[3]/2])).astype(np.int))
+            bottom_right = tuple(np.round(np.array([box[0] + box[2]/2, box[1] + box[3]/2])).astype(np.int))
+            self.im_hires = cv2.rectangle(self.im_hires, top_left, bottom_right, (255,255,255), 2)
+            self.im_hires_ann = cv2.rectangle(self.im_hires_ann, top_left, bottom_right, (255,255,255), 2)
+
+            ## Build images at other scales/resolutions, using torch
+            self._create_scaled_images(self.im_hires)
+
+            # Get new RNN output (new state)
+            glimpse, self.fix_loc, num_pix_observed = self._get_glimpse(self.fix_loc[0])
+            out_rnn = self.net.forward_rnn(glimpse, self.fix_loc).flatten()
+            state = out_rnn.detach().cpu().numpy()
+            self.last_state = state
 
 
         self.action_last = action
@@ -501,7 +624,7 @@ class EnvSaccadeMultDigits(Env):
         fig.clear()
         (ax1, ax2) = fig.subplots(2,1)
 
-        ax1.imshow(self.im_hires, aspect='auto') #, aspect='equal')
+        ax1.imshow(self.im_hires_ann, aspect='auto') #, aspect='equal')
         # ax1.set_xticklabels([])
         # ax1.set_yticklabels([])
         ax1.grid(True)
