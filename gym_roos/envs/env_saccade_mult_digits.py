@@ -343,22 +343,7 @@ class EnvSaccadeMultDigits(Env):
         area_true = (br_true[:,0] - tl_true[:,0] + 1) * (br_true[:,1] - tl_true[:,1] + 1)
 
         iou = interarea / (area_true + area_test - interarea)
-        if np.any(iou>1.0):
-            self._write_to_log(iou=iou)
-        if np.any(iou<0.0):
-            self._write_to_log(iou=iou)
         return iou
-
-    def _write_to_log(self, iou=None):
-        f = open('/Users/mattroos/scratch/env_log.txt','a+')
-        if iou is None:
-            f.write('self.reward_sum = %f\n' % (self.reward_sum))
-            f.write('self.reward_sum_classify = %f\n' % (self.reward_sum_classify))
-            f.write('self.reward_sum_localize = %f\n' % (self.reward_sum_localize))
-            f.write('self.reward_sum_foveal = %f\n\n' % (self.reward_sum_foveal))
-        else:
-            f.write('iou = %f\n\n' % (iou))
-        f.close()
 
     def _get_classify_reward(self, location, char_prediction):
         ## DEPRICATED.
@@ -498,9 +483,9 @@ class EnvSaccadeMultDigits(Env):
                 self.reward_sum_localize += rew_loc
 
                 # Remove char from list of rewardables ...
-                self.char_labels = np.delete(self.char_labels, ix_closest, axis=0)
-                self.char_locations = np.delete(self.char_locations, ix_closest, axis=0)
-                self.char_radii = np.delete(self.char_radii, ix_closest, axis=0)
+                self.char_labels = np.delete(self.char_labels, ix_cand[ix_closest], axis=0)
+                self.char_locations = np.delete(self.char_locations, ix_cand[ix_closest], axis=0)
+                self.char_radii = np.delete(self.char_radii, ix_cand[ix_closest], axis=0)
             else:
                 if self.char_labels[ix_cand][ix_closest]==char_prediction:
                     reward += R_CLASSIFY
@@ -511,9 +496,9 @@ class EnvSaccadeMultDigits(Env):
                     self.reward_sum_localize += rew_loc
                     
                     # Remove char from list of rewardables ...
-                    self.char_labels = np.delete(self.char_labels, ix_closest, axis=0)
-                    self.char_locations = np.delete(self.char_locations, ix_closest, axis=0)
-                    self.char_radii = np.delete(self.char_radii, ix_closest, axis=0)
+                    self.char_labels = np.delete(self.char_labels, ix_cand[ix_closest], axis=0)
+                    self.char_locations = np.delete(self.char_locations, ix_cand[ix_closest], axis=0)
+                    self.char_radii = np.delete(self.char_radii, ix_cand[ix_closest], axis=0)
                 else:
                     reward += R_MISCLASSIFY
                     self.reward_sum_classify += R_MISCLASSIFY
@@ -556,11 +541,6 @@ class EnvSaccadeMultDigits(Env):
 
         action_strings = np.array(['saccade', 'classify', 'uncertain', 'done'])
         action_taken = action_strings[np.argmax(action[:len(action_strings)])]
-
-        if done and self.reward_sum > 300:
-            self._write_to_log()
-        if done and self.reward_sum < 0:
-            self._write_to_log()
 
         if action_taken == 'done':
             reward = 0
@@ -642,10 +622,6 @@ class EnvSaccadeMultDigits(Env):
         # print('a=%d, x=%0.2f, y=%0.2f, r=%0.1f, tr= %0.1f, d=%s' % (action_taken, self.fix_loc[0][0], self.fix_loc[0][1],
         #                                                             reward, self.reward_sum, done,))
         # self.render()
-        if done and self.reward_sum > 300:
-            self._write_to_log()
-        if done and self.reward_sum < 0:
-            self._write_to_log()
 
         return state, reward, done, {}
 
