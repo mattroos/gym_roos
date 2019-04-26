@@ -313,7 +313,7 @@ class EnvSaccadeMultDigits(Env):
 
                 # Draw an outline of the foveal region on the image, for rendering
                 # cv2.rectangle(self.im_hires, (ix_left,iy_top), (ix_right,iy_bottom), (0,0,0), 2)
-                cv2.rectangle(self.im_hires_ann, (ix_left,iy_top), (ix_right,iy_bottom), (0,0,0), 2)
+                cv2.rectangle(self.im_hires_ann, (ix_left,iy_top), (ix_right,iy_bottom), (0,0,0), 1)
 
         return glimpse, fix_loc, num_pix_observed
 
@@ -343,8 +343,22 @@ class EnvSaccadeMultDigits(Env):
         area_true = (br_true[:,0] - tl_true[:,0] + 1) * (br_true[:,1] - tl_true[:,1] + 1)
 
         iou = interarea / (area_true + area_test - interarea)
+        if np.any(iou>1.0):
+            self._write_to_log(iou=iou)
+        if np.any(iou<0.0):
+            self._write_to_log(iou=iou)
         return iou
 
+    def _write_to_log(self, iou=None):
+        f = open('/Users/mattroos/scratch/env_log.txt','a+')
+        if iou is None:
+            f.write('self.reward_sum = %f\n' % (self.reward_sum))
+            f.write('self.reward_sum_classify = %f\n' % (self.reward_sum_classify))
+            f.write('self.reward_sum_localize = %f\n' % (self.reward_sum_localize))
+            f.write('self.reward_sum_foveal = %f\n\n' % (self.reward_sum_foveal))
+        else:
+            f.write('iou = %f\n\n' % (iou))
+        f.close()
 
     def _get_classify_reward(self, location, char_prediction):
         ## DEPRICATED.
@@ -452,6 +466,10 @@ class EnvSaccadeMultDigits(Env):
         #  rewardable decisions. If it is incorrectly predicted no localization
         #  reward is given, and misclassification penalty is given, and the
         #  character is not removed from the list of rewardables.
+        pdb.set_trace()
+
+        char_localized = False
+        reward = 0
 
         ## Get indices of true characters (candidates) with which prediction should be compared.
         if char_prediction:
@@ -461,29 +479,21 @@ class EnvSaccadeMultDigits(Env):
 
         ## If no rewardable characters are left, penalize (if needed) and return.
         if len(ix_cand)==0:
-            if char_prediction is None:
-                reward = 0
-            else:
+            if char_prediction is not None:
                 reward = R_MISCLASSIFY
                 self.reward_sum_classify += R_MISCLASSIFY
-            return reward
-
-        reward = 0
+            return reward, char_localized
 
         # Find the IOU similarity (1 - Jaccard distance) between the predicted
         # location and all candidate characters.
         location_converted = np.copy(location)
         location_converted[2:4] = (location[2:4]+1)/2 * self.im_pix
-        similarities = self._iou(location_converted, self.char_locations)
-        # rad = self.char_radii[ix_cand]
-        # center_in_pix = (self.char_locations[ix_cand,0:2]+1)/2 * self.im_pix
-        # dist = np.sqrt(np.sum(((location[0:2]+1)/2*self.im_pix - center_in_pix)**2, axis=1))
+        similarities = self._iou(location_converted, self.char_locations[ix_cand])
         ix_closest = np.argmax(similarities)
 
-        # if dist[ix_closest] < rad[ix_closest]:
         if similarities[ix_closest] > 0:
+            char_localized = True
             if char_prediction is None:
-                # rew_loc = max(rad[ix_closest] - dist[ix_closest],0) / rad[ix_closest] * R_LOCALIZE
                 rew_loc = similarities[ix_closest] * R_LOCALIZE
                 reward += rew_loc
                 self.reward_sum_localize += rew_loc
@@ -493,11 +503,10 @@ class EnvSaccadeMultDigits(Env):
                 self.char_locations = np.delete(self.char_locations, ix_closest, axis=0)
                 self.char_radii = np.delete(self.char_radii, ix_closest, axis=0)
             else:
-                if self.char_labels[ix_closest]==char_prediction:
+                if self.char_labels[ix_cand][ix_closest]==char_prediction:
                     reward += R_CLASSIFY
                     self.reward_sum_classify += R_CLASSIFY
 
-                    # rew_loc = max(rad[ix_closest] - dist[ix_closest],0) / rad[ix_closest] * R_LOCALIZE
                     rew_loc = similarities[ix_closest] * R_LOCALIZE
                     reward += rew_loc
                     self.reward_sum_localize += rew_loc
@@ -512,7 +521,7 @@ class EnvSaccadeMultDigits(Env):
                     # No reward for localization if misclassified.
                     # Leave char in list of rewardables.
 
-        return reward
+        return reward, char_localized
 
 
     def reset(self):
@@ -521,11 +530,12 @@ class EnvSaccadeMultDigits(Env):
         self.reward_sum_localize = 0
         self.reward_sum_foveal = 0
         self.current_step = 0
-        self._create_image(1)
+        self._create_image(3)
         glimpse, self.fix_loc, num_pix_observed = self._get_glimpse()
 
         # Exclude pix in initial foveal region from total number of pix "observable" by agent...
-        self.max_pix_observable = np.sum(self.imbw) - num_pix_observed
+        # self.max_pix_observable = np.sum(self.imbw) - num_pix_observed
+        self.max_pix_observable = np.sum(self.unobserved)
 
         # Output of independently trained RNN is the environment state.
         out_rnn = self.net.forward_rnn(glimpse, self.fix_loc)
@@ -548,6 +558,11 @@ class EnvSaccadeMultDigits(Env):
         action_strings = np.array(['saccade', 'classify', 'uncertain', 'done'])
         action_taken = action_strings[np.argmax(action[:len(action_strings)])]
 
+        if done and self.reward_sum > 300:
+            self._write_to_log()
+        if done and self.reward_sum < 0:
+            self._write_to_log()
+
         if action_taken == 'done':
             reward = 0
             done = True
@@ -569,6 +584,16 @@ class EnvSaccadeMultDigits(Env):
             state = out_rnn.detach().cpu().numpy()
             self.last_state = state
             rew_foveal = (num_pix_observed) / (self.max_pix_observable + eps) * R_FOVEAL
+
+            # Unknown bug causing summed foveal reward to sometimes be more than the max.
+            # Use the kluge to "fix" it.
+            # TODO: Figure out the real source of the problem!
+            if self.reward_sum_foveal + rew_foveal > R_FOVEAL:
+                rew_foveal = R_FOVEAL - self.reward_sum_foveal
+            elif self.reward_sum_foveal + rew_foveal < 0:
+                rew_foveal = 0 - self.reward_sum_foveal
+            # End of kluge "fix"
+
             reward += rew_foveal
             self.reward_sum_foveal += rew_foveal
 
@@ -580,7 +605,8 @@ class EnvSaccadeMultDigits(Env):
                 char_prediction = np.argmax(action[-self.n_classes:])
                 # reward += self._get_classify_reward(action[4:8], char_prediction=char_prediction)
                 # reward += self._get_classify_reward2(action[4:8], char_prediction=char_prediction)
-                reward += self._get_classify_reward3(action[4:8], char_prediction=char_prediction)
+                rew_classify, char_localized = self._get_classify_reward3(action[4:8], char_prediction=char_prediction)
+                reward += rew_classify
             else:
                 # Uncertain.
                 # In this case the reward landscape is decremented as if the
@@ -588,26 +614,27 @@ class EnvSaccadeMultDigits(Env):
                 # a fraction of what a true classification reward would be.
                 # reward += self._get_classify_reward2(action[4:8], char_prediction=None)
                 # reward += self._get_classify_reward2(action[4:8], char_prediction=None)
-                reward += self._get_classify_reward3(action[4:8], char_prediction=None)
+                rew_classify, char_localized = self._get_classify_reward3(action[4:8], char_prediction=None)
+                reward += rew_classify
 
+            if char_localized:
+                ## Annotate predicted bounding box. Would be nice to do this with black/white
+                # dashed line instead, so it will be visible regardless of back/foreground colors.
+                box = action[4:8]
+                box = (box+1)/2 * self.im_pix     # convert to pixel coordinates
+                top_left = tuple(np.round(np.array([box[0] - box[2]/2, box[1] - box[3]/2])).astype(np.int))
+                bottom_right = tuple(np.round(np.array([box[0] + box[2]/2, box[1] + box[3]/2])).astype(np.int))
+                self.im_hires = cv2.rectangle(self.im_hires, top_left, bottom_right, (255,255,255), 2)
+                self.im_hires_ann = cv2.rectangle(self.im_hires_ann, top_left, bottom_right, (255,255,255), 2)
 
-            ## Annotate predicted bounding box. Would be nice to do this with black/white
-            # dashed line instead, so it will be visible regardless of back/foreground colors.
-            box = action[4:8]
-            box = (box+1)/2 * self.im_pix     # convert to pixel coordinates
-            top_left = tuple(np.round(np.array([box[0] - box[2]/2, box[1] - box[3]/2])).astype(np.int))
-            bottom_right = tuple(np.round(np.array([box[0] + box[2]/2, box[1] + box[3]/2])).astype(np.int))
-            self.im_hires = cv2.rectangle(self.im_hires, top_left, bottom_right, (255,255,255), 2)
-            self.im_hires_ann = cv2.rectangle(self.im_hires_ann, top_left, bottom_right, (255,255,255), 2)
+                ## Build images at other scales/resolutions, using torch
+                self._create_scaled_images(self.im_hires)
 
-            ## Build images at other scales/resolutions, using torch
-            self._create_scaled_images(self.im_hires)
-
-            # Get new RNN output (new state)
-            glimpse, self.fix_loc, num_pix_observed = self._get_glimpse(self.fix_loc[0])
-            out_rnn = self.net.forward_rnn(glimpse, self.fix_loc).flatten()
-            state = out_rnn.detach().cpu().numpy()
-            self.last_state = state
+                # Get new RNN output (new state)
+                glimpse, self.fix_loc, num_pix_observed = self._get_glimpse(self.fix_loc[0])
+                out_rnn = self.net.forward_rnn(glimpse, self.fix_loc).flatten()
+                state = out_rnn.detach().cpu().numpy()
+                self.last_state = state
 
 
         self.action_last = action
@@ -616,6 +643,11 @@ class EnvSaccadeMultDigits(Env):
         # print('a=%d, x=%0.2f, y=%0.2f, r=%0.1f, tr= %0.1f, d=%s' % (action_taken, self.fix_loc[0][0], self.fix_loc[0][1],
         #                                                             reward, self.reward_sum, done,))
         # self.render()
+        if done and self.reward_sum > 300:
+            self._write_to_log()
+        if done and self.reward_sum < 0:
+            self._write_to_log()
+
         return state, reward, done, {}
 
 
@@ -635,7 +667,7 @@ class EnvSaccadeMultDigits(Env):
         #     self.reward_sum, self.fix_loc[0][0], self.fix_loc[0][1], self.action_last[6], self.action_last[7]))
         ax1.set_title('s %d, la=%d, rf/rl/rc=%0.1f,%0.1f,%0.1f, fix=%0.1f,%0.1f' %(self.current_step, self.action_taken_last,
             self.reward_sum_foveal, self.reward_sum_localize, self.reward_sum_classify, self.fix_loc[0][0], self.fix_loc[0][1]))
-        print(self.action_last)
+        # print(self.action_last)
 
         ax2.imshow(self.unobserved, aspect='auto') #, aspect='equal')
         # ax2.set_xticklabels([])
@@ -643,4 +675,4 @@ class EnvSaccadeMultDigits(Env):
         ax2.grid(True)
 
         plt.pause(0.05)
-        pdb.set_trace()
+        # pdb.set_trace()
