@@ -466,7 +466,6 @@ class EnvSaccadeMultDigits(Env):
         #  rewardable decisions. If it is incorrectly predicted no localization
         #  reward is given, and misclassification penalty is given, and the
         #  character is not removed from the list of rewardables.
-        pdb.set_trace()
 
         char_localized = False
         reward = 0
