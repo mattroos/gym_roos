@@ -37,7 +37,7 @@ plt.ion()
 
 
 R_CLASSIFY = 100.
-R_LOCALIZE = 100.
+R_LOCALIZE = 0.
 R_FOVEAL = 100.
 # R_MISCLASSIFY = -R_CLASSIFY   # Misclassification penalty hurts convergence?
 R_MISCLASSIFY = -0.
@@ -318,7 +318,7 @@ class EnvSaccadeMultDigits(Env):
         return glimpse, fix_loc, num_pix_observed
 
 
-    def _iou(self, test_location, true_locations):
+    def _iou(self, test_location, true_locations, modified=False):
         ## location arrays should be: [ x_center(-1,1), y_center(-1,1), w(pixels), h(pixels) ]
 
         # Covert (x,y) coordinates to pixel units
@@ -342,7 +342,14 @@ class EnvSaccadeMultDigits(Env):
         area_test = (br_test[0] - tl_test[0] + 1) * (br_test[1] - tl_test[1] + 1)
         area_true = (br_true[:,0] - tl_true[:,0] + 1) * (br_true[:,1] - tl_true[:,1] + 1)
 
-        iou = interarea / (area_true + area_test - interarea)
+        if modified:
+            iou = (2 * interarea - area_test) / (area_true + eps)
+            # More interpretable form of the above, for reference:
+            #    iou = (interarea - (area_test - interarea)) / (area_true + eps)
+            # The "area_test - interarea" term is the area of excess of the test box beyond the true box.
+        else:
+            iou = interarea / (area_true + area_test - interarea + eps)
+
         return iou
 
     def _get_classify_reward(self, location, char_prediction):
@@ -404,16 +411,23 @@ class EnvSaccadeMultDigits(Env):
         dist = np.sqrt(np.sum(((location[0:2]+1)/2*self.im_pix - center_in_pix)**2, axis=1))
         ix_closest = np.argmin(dist)
 
-        if dist[ix_closest] < rad[ix_closest]:
+        # Only give reward if location is inside bounding box
+        center_pix_test = (location[0:2]+1)/2*self.im_pix
+        if center_pix_test[0] > center_in_pix[ix_closest,0] - self.char_locations[ix_closest,2]/2 \
+            and center_pix_test[0] < center_in_pix[ix_closest,0] + self.char_locations[ix_closest,2]/2 \
+            and center_pix_test[1] > center_in_pix[ix_closest,1] - self.char_locations[ix_closest,3]/2 \
+            and center_pix_test[1] < center_in_pix[ix_closest,1] + self.char_locations[ix_closest,3]/2:
+        # if dist[ix_closest] < rad[ix_closest]:
             if char_prediction is None:
-                rew_loc = max(rad[ix_closest] - dist[ix_closest],0) / rad[ix_closest] * R_LOCALIZE
-                reward += rew_loc
-                self.reward_sum_localize += rew_loc
+                # # rew_loc = max(rad[ix_closest] - dist[ix_closest],0) / rad[ix_closest] * R_LOCALIZE
+                # reward += rew_loc
+                # self.reward_sum_localize += rew_loc
 
-                # Remove char from list of rewardables ...
-                self.char_labels = np.delete(self.char_labels, ix_closest, axis=0)
-                self.char_locations = np.delete(self.char_locations, ix_closest, axis=0)
-                self.char_radii = np.delete(self.char_radii, ix_closest, axis=0)
+                # # Remove char from list of rewardables ...
+                # self.char_labels = np.delete(self.char_labels, ix_closest, axis=0)
+                # self.char_locations = np.delete(self.char_locations, ix_closest, axis=0)
+                # self.char_radii = np.delete(self.char_radii, ix_closest, axis=0)
+                pass
             else:
                 if self.char_labels[ix_closest]==char_prediction:
                     reward += R_CLASSIFY
@@ -472,7 +486,8 @@ class EnvSaccadeMultDigits(Env):
         # location and all candidate characters.
         location_converted = np.copy(location)
         location_converted[2:4] = (location[2:4]+1)/2 * self.im_pix
-        similarities = self._iou(location_converted, self.char_locations[ix_cand])
+        # similarities = self._iou(location_converted, self.char_locations[ix_cand])
+        similarities = self._iou(location_converted, self.char_locations[ix_cand], modified=True)
         ix_closest = np.argmax(similarities)
 
         if similarities[ix_closest] > 0:
@@ -487,7 +502,7 @@ class EnvSaccadeMultDigits(Env):
                 self.char_locations = np.delete(self.char_locations, ix_cand[ix_closest], axis=0)
                 self.char_radii = np.delete(self.char_radii, ix_cand[ix_closest], axis=0)
             else:
-                if self.char_labels[ix_cand][ix_closest]==char_prediction:
+                if self.char_labels[ix_cand[ix_closest]]==char_prediction:
                     reward += R_CLASSIFY
                     self.reward_sum_classify += R_CLASSIFY
 
@@ -555,6 +570,7 @@ class EnvSaccadeMultDigits(Env):
         # uncertain declaration, if action variables for fixation location are same as those
         # for predicted character center location.
         ##############################################
+        char_localized = False
         if action_taken != 'done':
             # Declaration: saccade, classify, or uncertain
             glimpse, self.fix_loc, num_pix_observed = self._get_glimpse(action[4:6])    # action[4,5] = x,y
@@ -582,27 +598,31 @@ class EnvSaccadeMultDigits(Env):
             if action_taken == 'classify':
                 # Classify
                 char_prediction = np.argmax(action[-self.n_classes:])
-                # reward += self._get_classify_reward(action[4:8], char_prediction=char_prediction)
-                # reward += self._get_classify_reward2(action[4:8], char_prediction=char_prediction)
-                rew_classify, char_localized = self._get_classify_reward3(action[4:8], char_prediction=char_prediction)
+                # rew_classify = self._get_classify_reward(action[4:8], char_prediction=char_prediction)
+                rew_classify = self._get_classify_reward2(action[4:8], char_prediction=char_prediction)
+                # rew_classify, char_localized = self._get_classify_reward3(action[4:8], char_prediction=char_prediction)
                 reward += rew_classify
             else:
                 # Uncertain.
                 # In this case the reward landscape is decremented as if the
                 # correct classification was given, but the actual reward is only
                 # a fraction of what a true classification reward would be.
-                # reward += self._get_classify_reward2(action[4:8], char_prediction=None)
-                # reward += self._get_classify_reward2(action[4:8], char_prediction=None)
-                rew_classify, char_localized = self._get_classify_reward3(action[4:8], char_prediction=None)
+                # rew_classify = self._get_classify_reward2(action[4:8], char_prediction=None)
+                rew_classify = self._get_classify_reward2(action[4:8], char_prediction=None)
+                # rew_classify, char_localized = self._get_classify_reward3(action[4:8], char_prediction=None)
                 reward += rew_classify
 
-            if char_localized:
+            # if char_localized:
+            if action_taken == 'classify':
                 ## Annotate predicted bounding box. Would be nice to do this with black/white
                 # dashed line instead, so it will be visible regardless of back/foreground colors.
                 box = action[4:8]
                 box = (box+1)/2 * self.im_pix     # convert to pixel coordinates
-                top_left = tuple(np.round(np.array([box[0] - box[2]/2, box[1] - box[3]/2])).astype(np.int))
-                bottom_right = tuple(np.round(np.array([box[0] + box[2]/2, box[1] + box[3]/2])).astype(np.int))
+                # top_left = tuple(np.round(np.array([box[0] - box[2]/2, box[1] - box[3]/2])).astype(np.int))
+                # bottom_right = tuple(np.round(np.array([box[0] + box[2]/2, box[1] + box[3]/2])).astype(np.int))
+                ## Annotate fixation box rather than bounding box...
+                top_left = tuple(np.round(np.array([box[0] - self.fov_pix_half, box[1] - self.fov_pix_half])).astype(np.int))
+                bottom_right = tuple(np.round(np.array([box[0] + self.fov_pix_half, box[1] + self.fov_pix_half])).astype(np.int))
                 self.im_hires = cv2.rectangle(self.im_hires, top_left, bottom_right, (255,255,255), 2)
                 self.im_hires_ann = cv2.rectangle(self.im_hires_ann, top_left, bottom_right, (255,255,255), 2)
 
@@ -650,4 +670,4 @@ class EnvSaccadeMultDigits(Env):
         ax2.grid(True)
 
         plt.pause(0.05)
-        # pdb.set_trace()
+        pdb.set_trace()
