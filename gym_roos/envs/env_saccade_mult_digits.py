@@ -15,6 +15,13 @@
 #   env = EnvSaccadeMultDigits()
 
 
+###########################################
+# TODO:
+# Allow use of raw image and fixation location
+# environment state, rather than output of RNN.
+###########################################
+
+
 from gym_roos.envs.models import RnnChars2
 from gym_roos.envs import net_utils
 
@@ -31,6 +38,7 @@ import torch.nn.functional as F
 import os
 import time
 import random
+import datetime
 import pdb
 import matplotlib.pyplot as plt
 plt.ion()
@@ -42,6 +50,7 @@ R_FOVEAL = 100.
 # R_MISCLASSIFY = -R_CLASSIFY   # Misclassification penalty hurts convergence?
 R_MISCLASSIFY = -0.
 R_STEP_TIME = -0.
+R_DONE = 100.
 
 SCALES = [1, 3, 5]
 IM_PIX = 256
@@ -49,7 +58,7 @@ FOV_PIX = 32
 N_CNN_CHANNELS_OUT = [16, 16, 16, 16]
 # CHARS = '0123456789 '
 CHARS = '0123456789X'
-EP_LENGTH = 10
+EP_LENGTH = 15
 
 # NOTE: If more fonts are desired, see here:
 #   https://www.codesofinterest.com/2017/07/more-fonts-on-opencv.html
@@ -67,13 +76,11 @@ CVLINES = (cv2.FILLED, cv2.LINE_8, cv2.LINE_4, cv2.LINE_AA)
 eps = np.finfo(np.float).eps
 
 class EnvSaccadeMultDigits(Env):
-    def __init__(self, seed=None, cuda=False,
+    def __init__(self, cuda=False,
             # model_file='gym_roos/envs/model_params/model_env_saccade_digit.h5'):
-            # model_file='/home/mroos/Code/gym_roos/gym_roos/envs/model_params/model_env_saccade_digit.h5'):
-            model_file='/Users/mattroos/Code/gym_roos/gym_roos/envs/model_params/model_env_saccade_digit.h5'):
-        if seed is None:
-            seed = time.time()
-        random.seed(seed)
+            model_file='/home/mroos/Code/gym_roos/gym_roos/envs/model_params/model_env_saccade_digit.h5'):
+            # model_file='/Users/mattroos/Code/gym_roos/gym_roos/envs/model_params/model_env_saccade_digit.h5'):
+            # model_file=None):
 
         self.cuda = cuda
         self.device = torch.device("cuda:0" if torch.cuda.is_available() and cuda else "cpu")
@@ -87,39 +94,45 @@ class EnvSaccadeMultDigits(Env):
         self.fov_pix = FOV_PIX
         self.fov_pix_half = FOV_PIX//2
         self.images = [None]
-        self.mask = None
-        self.char = None
         self.reward_sum = 0
         self.reward_sum_classify = 0
         self.reward_sum_localize = 0
         self.reward_sum_foveal = 0
+        if model_file is None:
+            self.use_raw_sensor_data = True
+        else:
+            self.use_raw_sensor_data = False
 
         # action_strings are: [saccade, classify, uncertain, done, x_fix, y_fix, w, h, classes (11)]
         # TODO: Should "uncertain" be a different class, rather than a different action?
         self.action_space = Box(low=-1.0, high=1.0, shape=(self.n_classes+8,), dtype=np.float32)
         
-        # Observation space is ReLU output from RnnChars2 RNN
-        self.observation_space = Box(low=0.0, high=np.Inf, shape=(256,), dtype=np.float32)
+        if self.use_raw_sensor_data:
+            # Observation space is pixels and locations in range [-1,1]
+            self.observation_space = Box(low=-1.0, high=1.0, shape=(2 + 3*(32*32*3),), dtype=np.float32)
+        else:
+            # Observation space is ReLU output from RnnChars2 RNN
+            self.observation_space = Box(low=0.0, high=np.Inf, shape=(256,), dtype=np.float32)
 
-        ## Construct network.
-        #  The network is similar to that by Minh, et al.
-        #       http://papers.nips.cc/paper/5542-recurrent-models-of-visual-attention
-        #  It converts the input image (glimpse) and fixation coordinates into
-        #  a feature vector that is stored in an RNN. The output of the RNN
-        #  serves as the observation vector for this environment.
-        self.net = RnnChars2(n_pix_1d=self.fov_pix,
-                             n_scales=self.n_scales,
-                             n_cnn_channels_out=N_CNN_CHANNELS_OUT,
-                             n_classes=self.n_classes)
+            ## Construct network.
+            #  The network is similar to that by Minh, et al.
+            #       http://papers.nips.cc/paper/5542-recurrent-models-of-visual-attention
+            #  It converts the input image (glimpse) and fixation coordinates into
+            #  a feature vector that is stored in an RNN. The output of the RNN
+            #  serves as the observation vector for this environment.
+            self.net = RnnChars2(n_pix_1d=self.fov_pix,
+                                 n_scales=self.n_scales,
+                                 n_cnn_channels_out=N_CNN_CHANNELS_OUT,
+                                 n_classes=self.n_classes)
 
-        # Initialize network parameters.
-        # cwd = os.getcwd()
-        # print('\nLoading stored model parameters from %s' % os.path.join(cwd, model_file))
-        print('\nLoading stored model parameters from %s' % model_file)
-        step_start, learning_rate = net_utils.load_net(model_file, self.net, cuda=self.cuda)
+            # Initialize network parameters.
+            # cwd = os.getcwd()
+            # print('\nLoading stored model parameters from %s' % os.path.join(cwd, model_file))
+            print('\nLoading stored model parameters from %s' % model_file)
+            step_start, learning_rate = net_utils.load_net(model_file, self.net, cuda=self.cuda)
 
-        self.net.to(self.device)
-        self.net.eval()
+            self.net.to(self.device)
+            self.net.eval()
 
         self.action_last = np.zeros(self.action_space.shape)
         self.action_taken_last = -1
@@ -130,9 +143,10 @@ class EnvSaccadeMultDigits(Env):
         b_success = False
         while not b_success:
             try:
-                color_bg = (random.randint(0,255), random.randint(0,255), random.randint(0,255))
+                # color_bg = (random.randint(0,255), random.randint(0,255), random.randint(0,255))
+                # if np.sum(self.color_bg)==np.sum(color_fg) or np.sum(color_bg)==np.sum(color_fg):
                 color_fg = (random.randint(0,255), random.randint(0,255), random.randint(0,255))
-                if np.sum(self.color_bg)==np.sum(color_fg) or np.sum(color_bg)==np.sum(color_fg):
+                if np.sum(self.color_bg)==np.sum(color_fg):
                     # No color contrast. Method below for finding crop will fail.
                     continue
 
@@ -198,6 +212,7 @@ class EnvSaccadeMultDigits(Env):
                     self.char_center = (0.0, 0.0)   # meaningless for blank character
 
                 imbw = np.greater(imbw, 0.0)
+                mask = np.copy(imbw)
                 if np.any(np.logical_and(self.imbw, imbw)):
                     # character overlaps with one or more existing characters
                     continue
@@ -218,7 +233,7 @@ class EnvSaccadeMultDigits(Env):
                 traceback.print_exc(file=sys.stdout)
                 continue
 
-        return char_label, char_location
+        return char_label, char_location, mask
 
 
     def _create_image(self, num_chars=1):
@@ -231,10 +246,12 @@ class EnvSaccadeMultDigits(Env):
         ## Add characters
         self.char_labels = []
         self.char_locations = []
+        self.char_masks = []
         for i_char in range(num_chars):
-            char, location = self._add_char()
+            char, location, mask = self._add_char()
             self.char_labels.append(char)
             self.char_locations.append(location)
+            self.char_masks.append(mask)
         self.char_labels = np.array(self.char_labels)
         self.char_locations = np.array(self.char_locations)
         self.char_radii = np.sqrt((self.char_locations[:,2]/2)**2 + (self.char_locations[:,3]/2)**2)
@@ -270,7 +287,6 @@ class EnvSaccadeMultDigits(Env):
                 pooled.append(images)
 
         self.images = pooled
-        self.unobserved = np.copy(self.imbw)
 
 
     def _get_glimpse(self, fix_loc=None):
@@ -394,15 +410,15 @@ class EnvSaccadeMultDigits(Env):
         #  reward is given, and misclassification penalty is given, and the
         #  character is not removed from the list of rewardables.
 
-        if len(self.char_labels)==0:
-            if char_prediction is None:
-                reward = 0
-            else:
-                reward = R_MISCLASSIFY
-                self.reward_sum_classify += R_MISCLASSIFY
-            return reward
+        char_localized = False
+        rew_classify = 0
+        rew_foveal = 0
+        rew_loc = 0
 
-        reward = 0
+        if len(self.char_labels)==0:
+            if char_prediction is not None:
+                rew_classify = R_MISCLASSIFY
+            return rew_classify, rew_foveal, rew_loc, char_localized
 
         # Find the distance between the predicted location and all candidate characters
         # Could consider using normalized distance instead (normalized by radius)
@@ -420,8 +436,6 @@ class EnvSaccadeMultDigits(Env):
         # if dist[ix_closest] < rad[ix_closest]:
             if char_prediction is None:
                 # # rew_loc = max(rad[ix_closest] - dist[ix_closest],0) / rad[ix_closest] * R_LOCALIZE
-                # reward += rew_loc
-                # self.reward_sum_localize += rew_loc
 
                 # # Remove char from list of rewardables ...
                 # self.char_labels = np.delete(self.char_labels, ix_closest, axis=0)
@@ -430,24 +444,33 @@ class EnvSaccadeMultDigits(Env):
                 pass
             else:
                 if self.char_labels[ix_closest]==char_prediction:
-                    reward += R_CLASSIFY
-                    self.reward_sum_classify += R_CLASSIFY
+                    rew_classify += R_CLASSIFY
 
                     rew_loc = max(rad[ix_closest] - dist[ix_closest],0) / rad[ix_closest] * R_LOCALIZE
-                    reward += rew_loc
-                    self.reward_sum_localize += rew_loc
                     
                     # Remove char from list of rewardables ...
                     self.char_labels = np.delete(self.char_labels, ix_closest, axis=0)
                     self.char_locations = np.delete(self.char_locations, ix_closest, axis=0)
                     self.char_radii = np.delete(self.char_radii, ix_closest, axis=0)
+
+                    # Remove character from the image (only for early training?)
+                    self.imbw[self.char_masks[ix_closest]] = 0
+                    self.im_hires[self.char_masks[ix_closest]] = self.color_bg
+                    self.im_hires_ann[self.char_masks[ix_closest]] = self.color_bg
+
+                    # Give foveation reward for remaining unobserved pixels in classified character
+                    num_pix_observed = np.sum(self.unobserved[self.char_masks[ix_closest]])
+                    rew_foveal = (num_pix_observed) / (self.max_pix_observable + eps) * R_FOVEAL
+                    self.unobserved[self.char_masks[ix_closest]] = False
+
+                    self.char_masks = np.delete(self.char_masks, ix_closest, axis=0)
+                    char_localized = True
                 else:
-                    reward += R_MISCLASSIFY
-                    self.reward_sum_classify += R_MISCLASSIFY
+                    rew_classify += R_MISCLASSIFY
                     # No reward for localization if misclassified.
                     # Leave char in list of rewardables.
 
-        return reward
+        return rew_classify, rew_foveal, rew_loc, char_localized
 
 
     def _get_classify_reward3(self, location, char_prediction=None):
@@ -524,21 +547,34 @@ class EnvSaccadeMultDigits(Env):
 
 
     def reset(self):
+        random.seed(time.time())
+        self.env_seed = random.randint(0,4294967295) # 2**32-1 = 4294967295
+        random.seed(self.env_seed)
+        np.random.seed(self.env_seed)
+
         self.reward_sum = 0
         self.reward_sum_classify = 0
         self.reward_sum_localize = 0
         self.reward_sum_foveal = 0
         self.current_step = 0
         self._create_image(3)
+        self.unobserved = np.copy(self.imbw)
         glimpse, self.fix_loc, num_pix_observed = self._get_glimpse()
 
         # Exclude pix in initial foveal region from total number of pix "observable" by agent...
         # self.max_pix_observable = np.sum(self.imbw) - num_pix_observed
         self.max_pix_observable = np.sum(self.unobserved)
 
-        # Output of independently trained RNN is the environment state.
-        out_rnn = self.net.forward_rnn(glimpse, self.fix_loc)
-        self.last_state = out_rnn.detach().cpu().numpy().flatten()
+        if self.use_raw_sensor_data:
+            # Flatten all the input data
+            self.last_state = self.fix_loc[0].cpu().numpy()
+            for g in glimpse:
+                self.last_state = np.concatenate((self.last_state, g[0][0,:,:,:].cpu().numpy().flatten()))
+        else:
+            # Output of independently trained RNN is the environment state.
+            out_rnn = self.net.forward_rnn(glimpse, self.fix_loc)
+            self.last_state = out_rnn.detach().cpu().numpy().flatten()
+
         return self.last_state
 
 
@@ -558,7 +594,10 @@ class EnvSaccadeMultDigits(Env):
         action_taken = action_strings[np.argmax(action[:len(action_strings)])]
 
         if action_taken == 'done':
-            reward = 0
+            if len(self.char_labels)==0:
+                reward = R_DONE
+            else:
+                reward = 0
             done = True
             state = np.zeros(self.observation_space.shape)
         else:
@@ -574,9 +613,16 @@ class EnvSaccadeMultDigits(Env):
         if action_taken != 'done':
             # Declaration: saccade, classify, or uncertain
             glimpse, self.fix_loc, num_pix_observed = self._get_glimpse(action[4:6])    # action[4,5] = x,y
-            out_rnn = self.net.forward_rnn(glimpse, self.fix_loc).flatten()
 
-            state = out_rnn.detach().cpu().numpy()
+            if self.use_raw_sensor_data:
+                # Flatten all the input data
+                state = self.fix_loc[0].cpu().numpy()
+                for g in glimpse:
+                    state = np.concatenate((state, g[0][0,:,:,:].cpu().numpy().flatten()))
+            else:
+                out_rnn = self.net.forward_rnn(glimpse, self.fix_loc).flatten()
+                state = out_rnn.detach().cpu().numpy()
+
             self.last_state = state
             rew_foveal = (num_pix_observed) / (self.max_pix_observable + eps) * R_FOVEAL
 
@@ -584,8 +630,18 @@ class EnvSaccadeMultDigits(Env):
             # Use the kluge to "fix" it.
             # TODO: Figure out the real source of the problem!
             if self.reward_sum_foveal + rew_foveal > R_FOVEAL:
+                f = open('bug_log.txt', 'a')
+                now = datetime.datetime.now()
+                f.write(now.strftime("%Y-%m-%d %H:%M:%S - "))
+                f.write('self.reward_sum_foveal + rew_foveal > R_FOVEAL, self.reward_sum_foveal=%f, rew_foveal=%f' % (self.reward_sum_foveal, rew_foveal))
+                f.close()
                 rew_foveal = R_FOVEAL - self.reward_sum_foveal
             elif self.reward_sum_foveal + rew_foveal < 0:
+                f = open('bug_log.txt', 'a')
+                now = datetime.datetime.now()
+                f.write(now.strftime("%Y-%m-%d %H:%M:%S - "))
+                f.write('self.reward_sum_foveal + rew_foveal < 0, self.reward_sum_foveal=%f, rew_foveal=%f' % (self.reward_sum_foveal, rew_foveal))
+                f.close()
                 rew_foveal = 0 - self.reward_sum_foveal
             # End of kluge "fix"
 
@@ -599,40 +655,51 @@ class EnvSaccadeMultDigits(Env):
                 # Classify
                 char_prediction = np.argmax(action[-self.n_classes:])
                 # rew_classify = self._get_classify_reward(action[4:8], char_prediction=char_prediction)
-                rew_classify = self._get_classify_reward2(action[4:8], char_prediction=char_prediction)
+                rew_classify, rew_foveal, rew_loc, char_localized = self._get_classify_reward2(action[4:8], char_prediction=char_prediction)
                 # rew_classify, char_localized = self._get_classify_reward3(action[4:8], char_prediction=char_prediction)
-                reward += rew_classify
             else:
                 # Uncertain.
                 # In this case the reward landscape is decremented as if the
                 # correct classification was given, but the actual reward is only
                 # a fraction of what a true classification reward would be.
                 # rew_classify = self._get_classify_reward2(action[4:8], char_prediction=None)
-                rew_classify = self._get_classify_reward2(action[4:8], char_prediction=None)
+                rew_classify, rew_foveal, rew_loc, char_localized = self._get_classify_reward2(action[4:8], char_prediction=None)
                 # rew_classify, char_localized = self._get_classify_reward3(action[4:8], char_prediction=None)
-                reward += rew_classify
+            reward += rew_classify
+            reward += rew_foveal
+            reward += rew_loc
+            self.reward_sum_foveal += rew_foveal
+            self.reward_sum_classify += rew_classify
+            self.reward_sum_localize += rew_loc
 
-            # if char_localized:
-            if action_taken == 'classify':
-                ## Annotate predicted bounding box. Would be nice to do this with black/white
-                # dashed line instead, so it will be visible regardless of back/foreground colors.
-                box = action[4:8]
-                box = (box+1)/2 * self.im_pix     # convert to pixel coordinates
-                # top_left = tuple(np.round(np.array([box[0] - box[2]/2, box[1] - box[3]/2])).astype(np.int))
-                # bottom_right = tuple(np.round(np.array([box[0] + box[2]/2, box[1] + box[3]/2])).astype(np.int))
-                ## Annotate fixation box rather than bounding box...
-                top_left = tuple(np.round(np.array([box[0] - self.fov_pix_half, box[1] - self.fov_pix_half])).astype(np.int))
-                bottom_right = tuple(np.round(np.array([box[0] + self.fov_pix_half, box[1] + self.fov_pix_half])).astype(np.int))
-                self.im_hires = cv2.rectangle(self.im_hires, top_left, bottom_right, (255,255,255), 2)
-                self.im_hires_ann = cv2.rectangle(self.im_hires_ann, top_left, bottom_right, (255,255,255), 2)
+            if char_localized:
+            # # if action_taken == 'classify':
+            #     ## Annotate predicted bounding box. Would be nice to do this with black/white
+            #     # dashed line instead, so it will be visible regardless of back/foreground colors.
+            #     box = action[4:8]
+            #     box = (box+1)/2 * self.im_pix     # convert to pixel coordinates
+            #     # top_left = tuple(np.round(np.array([box[0] - box[2]/2, box[1] - box[3]/2])).astype(np.int))
+            #     # bottom_right = tuple(np.round(np.array([box[0] + box[2]/2, box[1] + box[3]/2])).astype(np.int))
+            #     ## Annotate fixation box rather than bounding box...
+            #     top_left = tuple(np.round(np.array([box[0] - self.fov_pix_half, box[1] - self.fov_pix_half])).astype(np.int))
+            #     bottom_right = tuple(np.round(np.array([box[0] + self.fov_pix_half, box[1] + self.fov_pix_half])).astype(np.int))
+            #     self.im_hires = cv2.rectangle(self.im_hires, top_left, bottom_right, (255,255,255), -1)
+            #     self.im_hires_ann = cv2.rectangle(self.im_hires_ann, top_left, bottom_right, (255,255,255), -1)
 
                 ## Build images at other scales/resolutions, using torch
                 self._create_scaled_images(self.im_hires)
 
-                # Get new RNN output (new state)
+                # Get new state
                 glimpse, self.fix_loc, num_pix_observed = self._get_glimpse(self.fix_loc[0])
-                out_rnn = self.net.forward_rnn(glimpse, self.fix_loc).flatten()
-                state = out_rnn.detach().cpu().numpy()
+                if self.use_raw_sensor_data:
+                    # Flatten all the input data
+                    state = self.fix_loc[0].cpu().numpy()
+                    for g in glimpse:
+                        state = np.concatenate((state, g[0][0,:,:,:].cpu().numpy().flatten()))
+                else:
+                    # Output of independently trained RNN is the environment state.
+                    out_rnn = self.net.forward_rnn(glimpse, self.fix_loc).flatten()
+                    state = out_rnn.detach().cpu().numpy()
                 self.last_state = state
 
 
@@ -643,6 +710,15 @@ class EnvSaccadeMultDigits(Env):
         #                                                             reward, self.reward_sum, done,))
         # self.render()
 
+        if done:
+            # print('seed=%10d, reward=%05.1f' % (self.env_seed, self.reward_sum))
+            if self.reward_sum > 400.1:
+                f = open('bug_log.txt', 'a')
+                now = datetime.datetime.now()
+                f.write(now.strftime("%Y-%m-%d %H:%M:%S - "))
+                f.write('seed=%10d, reward=%05.1f, rew_class=%05.1f, rew_fov=%05.1f,rew_loc=%05.1f\n' %
+                    (self.env_seed, self.reward_sum, self.reward_sum_classify, self.reward_sum_foveal, self.reward_sum_localize))
+                f.close()
         return state, reward, done, {}
 
 
@@ -651,6 +727,7 @@ class EnvSaccadeMultDigits(Env):
         fig.clear()
         (ax1, ax2) = fig.subplots(2,1)
 
+        ax1.cla()
         ax1.imshow(self.im_hires_ann, aspect='auto') #, aspect='equal')
         # ax1.set_xticklabels([])
         # ax1.set_yticklabels([])
@@ -664,6 +741,7 @@ class EnvSaccadeMultDigits(Env):
             self.reward_sum_foveal, self.reward_sum_localize, self.reward_sum_classify, self.fix_loc[0][0], self.fix_loc[0][1]))
         # print(self.action_last)
 
+        ax2.cla()
         ax2.imshow(self.unobserved, aspect='auto') #, aspect='equal')
         # ax2.set_xticklabels([])
         # ax2.set_yticklabels([])
